@@ -10,15 +10,25 @@
 #include <vector>
 
 #include "db/db_impl/db_impl.h"
+#include "db/db_with_timestamp_test_util.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
+#include "test_util/testutil.h"
 #include "util/cast_util.h"
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+  std::string Timestamp(uint64_t ts) {
+    std::string ret;
+    PutFixed64(&ret, ts);
+    return ret;
+  }
+} // namespace
 
 class CompactFilesTest : public testing::Test {
  public:
@@ -482,6 +492,73 @@ TEST_F(CompactFilesTest, GetCompactionJobInfo) {
   ASSERT_EQ(compaction_job_info.output_level, 0);
   ASSERT_OK(compaction_job_info.status);
   // no assertion failure
+  delete db;
+}
+
+TEST_F(CompactFilesTest, CompactFilesRace) {
+  const int kNumLevel0Files = 4;
+  Options options;
+  options.create_if_missing = true;
+  options.compaction_style = kCompactionStyleNone;
+  options.compression = kNoCompression;
+  options.comparator = test::BytewiseComparatorWithU64TsWrapper();
+
+  DB* db = nullptr;
+  ASSERT_OK(DestroyDB(db_name_, options));
+  Status s = DB::Open(options, db_name_, &db);
+  ASSERT_OK(s);
+  assert(db);
+
+  uint64_t ts = 100;
+  uint64_t key = 0;
+  WriteOptions write_opts;
+  FlushOptions flush_opts;
+  for (; key < kNumLevel0Files; ++key, ++ts) {
+    ASSERT_OK(db->Put(write_opts, std::to_string(key), Timestamp(ts), ""));
+    ASSERT_OK(db->Flush(flush_opts));
+  }
+
+  std::vector<LiveFileMetaData> sst_metas;
+  std::vector<std::string> sst_files;
+  db->GetLiveFilesMetaData(&sst_metas);
+  ASSERT_EQ(4, sst_metas.size());
+  ASSERT_EQ(0, sst_metas[0].level);
+  for (auto& file : sst_metas) {
+    fprintf(stdout, "file: %s\n", file.name.c_str());
+    sst_files.emplace_back(file.name);
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+    {"CompactFilesImpl:0", "CompactFilesTest.CompactFilesRace:0"},
+    {"CompactFilesTest.CompactFilesRace:1", "CompactFilesImpl:1"}
+  });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+  ROCKSDB_NAMESPACE::port::Thread compaction_thread(
+    [&] { EXPECT_OK(db->CompactFiles(ROCKSDB_NAMESPACE::CompactionOptions(),
+                                     {sst_files[0], sst_files[1]}, 0)); });
+  
+  TEST_SYNC_POINT("CompactFilesTest.CompactFilesRace:0");
+  
+  Status status;
+  status = db->DeleteFile(sst_files[3]);
+  ASSERT_OK(status);
+  status = db->DeleteFile(sst_files[2]);
+  ASSERT_OK(status);
+
+  std::vector<LiveFileMetaData>().swap(sst_metas);
+  db->GetLiveFilesMetaData(&sst_metas);
+  ASSERT_EQ(2, sst_metas.size());
+  ASSERT_EQ(0, sst_metas[0].level);
+  for (auto& file : sst_metas) {
+    fprintf(stdout, "file: %s\n", file.name.c_str());
+  }
+
+  ASSERT_TRUE(db->CompactFiles(ROCKSDB_NAMESPACE::CompactionOptions(),
+                               {sst_files[2], sst_files[3]}, 0).IsAborted());
+
+  TEST_SYNC_POINT("CompactFilesTest.CompactFilesRace:1");
+  compaction_thread.join();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   delete db;
 }
 
